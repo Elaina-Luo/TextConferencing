@@ -1,15 +1,3 @@
-/*
- * client.c - Text Conferencing Lab (ECE361)
- * Self-contained single file, no external headers needed.
- *
- * Compile:  gcc -Wall -o client client.c
- * Run:      ./client
- *
- * Uses select() to simultaneously handle:
- *   - stdin (user commands / text messages)
- *   - the server socket (incoming messages)
- */
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,16 +9,12 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
-/* ═══════════════════════════════════════════════
-   Protocol constants  (must match server.c)
-   ═══════════════════════════════════════════════ */
 #define MAX_NAME        32
 #define MAX_DATA        512
 #define MAX_SESSION_ID  32
-#define BUF_SIZE        620   /* large enough for the whole serialized message */
+#define BUF_SIZE        620  
 #define MAX_COMMAND_LEN 32
 
-/* Packet type codes */
 typedef enum {
     LOGIN = 0,
     LO_ACK,
@@ -47,18 +31,16 @@ typedef enum {
     QU_ACK
 } message_t;
 
-/* Message struct */
+
 struct message {
     unsigned int  type;
     unsigned int  size;
-    char          source[MAX_NAME];
-    char          session_id[MAX_SESSION_ID];
-    char          data[MAX_DATA];
+    char source[MAX_NAME];
+    char session_id[MAX_SESSION_ID];
+    char data[MAX_DATA];
 };
 
-/* ═══════════════════════════════════════════════
-   Serialization  –  "type:size:source:session:data"
-   ═══════════════════════════════════════════════ */
+
 static void message_to_string(const struct message *m, char *dest)
 {
     memset(dest, 0, BUF_SIZE);
@@ -70,33 +52,33 @@ static void parse_message(const char *src, struct message *m)
 {
     memset(m, 0, sizeof *m);
 
-    /* work on a mutable copy */
+    // work on a mutable copy 
     char tmp[BUF_SIZE];
     strncpy(tmp, src, BUF_SIZE - 1);
 
     char *tok;
-    /* type */
+    // type 
     tok = strtok(tmp, ":");
     if (!tok) return;
     m->type = atoi(tok);
 
-    /* size */
+    // size
     tok = strtok(NULL, ":");
     if (!tok) return;
     m->size = atoi(tok);
 
-    /* source */
+    // source 
     tok = strtok(NULL, ":");
     if (!tok) return;
     strncpy(m->source, tok, MAX_NAME - 1);
 
-    /* session_id */
+    // session_id 
     tok = strtok(NULL, ":");
     if (!tok) return;
     strncpy(m->session_id, tok, MAX_SESSION_ID - 1);
 
-    /* data – may contain ':', so copy the rest of the string directly */
-    /* find offset of data field: skip past the 4 colons already consumed */
+    // data – may contain ':', so copy the rest of the string directly 
+    // find offset of data field: skip past the 4 colons already consumed 
     const char *p = src;
     int colons = 0;
     while (*p && colons < 4) {
@@ -114,13 +96,8 @@ static void print_message(const struct message *m)
         printf("%s: %s\n", m->source, m->data);
 }
 
-/* ═══════════════════════════════════════════════
-   Send a message over a socket
-   ═══════════════════════════════════════════════ */
-static int send_through(int sock, message_t type,
-                        const char *source,
-                        const char *session_id,
-                        const char *data)
+
+static int send_through(int sock, message_t type, const char *source, const char *session_id, const char *data)
 {
     struct message m;
     memset(&m, 0, sizeof m);
@@ -140,20 +117,14 @@ static int send_through(int sock, message_t type,
     return 0;
 }
 
-/* ═══════════════════════════════════════════════
-   Global client state
-   ═══════════════════════════════════════════════ */
+
 static int  client_sock   = -1;
 static int  is_in_session = 0;
 static char cur_session[MAX_SESSION_ID] = "";
 static char cur_name[MAX_NAME]          = "";
 static int  logged_in     = 0;
 
-/* ═══════════════════════════════════════════════
-   Receive exactly one ACK/NAK from the server.
-   Fills *m with the parsed message.
-   Returns 0 on success, 1 on error.
-   ═══════════════════════════════════════════════ */
+
 static int recv_response(struct message *m)
 {
     char buf[BUF_SIZE];
@@ -168,9 +139,8 @@ static int recv_response(struct message *m)
     return 0;
 }
 
-/* ═══════════════════════════════════════════════
-   /login <name> <pass> <server_ip> <server_port>
-   ═══════════════════════════════════════════════ */
+//login <name> <pass> <server_ip> <server_port>
+   
 static int login(const char *name, const char *pass,
                  const char *server_ip, const char *server_port)
 {
@@ -210,10 +180,10 @@ static int login(const char *name, const char *pass,
         return 1;
     }
 
-    /* Send LOGIN */
+    // Send LOGIN
     send_through(client_sock, LOGIN, name, "", pass);
 
-    /* Wait for LO_ACK / LO_NAK synchronously */
+    // Wait for LO_ACK / LO_NAK synchronously 
     struct message resp;
     if (recv_response(&resp)) {
         close(client_sock);
@@ -234,9 +204,7 @@ static int login(const char *name, const char *pass,
     }
 }
 
-/* ═══════════════════════════════════════════════
-   /logout
-   ═══════════════════════════════════════════════ */
+
 static int logout(void)
 {
     if (!logged_in) { printf("Not logged in.\n"); return 1; }
@@ -252,9 +220,7 @@ static int logout(void)
     return 0;
 }
 
-/* ═══════════════════════════════════════════════
-   /joinsession <session_id>
-   ═══════════════════════════════════════════════ */
+
 static int join_session(const char *session_id)
 {
     if (!logged_in)   { printf("Not logged in.\n"); return 1; }
@@ -277,9 +243,7 @@ static int join_session(const char *session_id)
     }
 }
 
-/* ═══════════════════════════════════════════════
-   /leavesession
-   ═══════════════════════════════════════════════ */
+
 static int leave_session(void)
 {
     if (!logged_in)    { printf("Not logged in.\n"); return 1; }
@@ -292,9 +256,7 @@ static int leave_session(void)
     return 0;
 }
 
-/* ═══════════════════════════════════════════════
-   /createsession <session_id>
-   ═══════════════════════════════════════════════ */
+
 static int create_session(const char *session_id)
 {
     if (!logged_in)    { printf("Not logged in.\n"); return 1; }
@@ -317,9 +279,7 @@ static int create_session(const char *session_id)
     }
 }
 
-/* ═══════════════════════════════════════════════
-   /list
-   ═══════════════════════════════════════════════ */
+
 static int list(void)
 {
     if (!logged_in) { printf("Not logged in.\n"); return 1; }
@@ -333,9 +293,7 @@ static int list(void)
     return 0;
 }
 
-/* ═══════════════════════════════════════════════
-   /quit
-   ═══════════════════════════════════════════════ */
+
 static int quit(void)
 {
     if (logged_in) logout();
@@ -343,9 +301,6 @@ static int quit(void)
     exit(0);
 }
 
-/* ═══════════════════════════════════════════════
-   Send plain text as a MESSAGE to current session
-   ═══════════════════════════════════════════════ */
 static int send_message(const char *text)
 {
     if (!logged_in)    { printf("Not logged in.\n"); return 1; }
@@ -355,9 +310,7 @@ static int send_message(const char *text)
     return 0;
 }
 
-/* ═══════════════════════════════════════════════
-   Process one line of user input from stdin
-   ═══════════════════════════════════════════════ */
+
 static void handle_stdin(void)
 {
     char command[MAX_COMMAND_LEN];
@@ -367,7 +320,7 @@ static void handle_stdin(void)
     char server_ip[64];
     char server_port[16];
 
-    /* Read first token (the command) */
+    // Read first token (the command) 
     if (scanf("%s", command) != 1) return;
 
     if (strcmp(command, "/login") == 0) {
@@ -395,11 +348,10 @@ static void handle_stdin(void)
         quit();
 
     } else {
-        /* Not a command — treat as chat text.
-           Read rest of the line and prepend the first word. */
+
         if (!logged_in) {
             printf("Not logged in.\n");
-            /* consume rest of line */
+            // consume rest of line 
             char discard[MAX_DATA];
             fgets(discard, sizeof discard, stdin);
             return;
@@ -407,17 +359,14 @@ static void handle_stdin(void)
         char msg_buf[MAX_DATA];
         strncpy(msg_buf, command, MAX_DATA - 1);
         int offset = strlen(msg_buf);
-        /* read the rest of the line */
+        // read the rest of the line 
         fgets(msg_buf + offset, MAX_DATA - offset, stdin);
-        /* strip trailing newline */
+        // strip trailing newline 
         msg_buf[strcspn(msg_buf, "\n")] = '\0';
         send_message(msg_buf);
     }
 }
 
-/* ═══════════════════════════════════════════════
-   Handle one incoming packet from the server
-   ═══════════════════════════════════════════════ */
 static void handle_server(void)
 {
     char buf[BUF_SIZE];
@@ -466,9 +415,7 @@ static void handle_server(void)
     fflush(stdout);
 }
 
-/* ═══════════════════════════════════════════════
-   Main – select() loop
-   ═══════════════════════════════════════════════ */
+
 int main(void)
 {
     printf("ECE361 Text Conferencing Client\n");
@@ -489,12 +436,12 @@ int main(void)
             select(fileno(stdin) + 1, &fds, NULL, NULL, NULL);
         }
 
-        /* Incoming data from the server */
+        // Incoming data from the server 
         if (client_sock > 0 && FD_ISSET(client_sock, &fds)) {
             handle_server();
         }
 
-        /* User typed something */
+        // User typed something 
         if (FD_ISSET(fileno(stdin), &fds)) {
             handle_stdin();
         }
