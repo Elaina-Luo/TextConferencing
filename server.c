@@ -3,9 +3,13 @@
  *
  * Usage: ./server <TCP port number>
  *
- * The server acts as both a conference session router and a database.
- * It uses select() for synchronous I/O multiplexing to handle
- * multiple clients simultaneously without threads.
+ * Wire format matches client.c exactly:
+ *   - Messages serialized as text: "type:size:source:session_id:data\0"
+ *   - Fixed BUF_SIZE buffer per send/recv
+ *   - message_t enum values start at 0 (LOGIN=0, LO_ACK=1, ...)
+ *   - MAX_NAME=32, MAX_DATA=512, MAX_SESSION_ID=32
+ *
+ * Uses select() for synchronous I/O multiplexing.
  */
 
 #include <stdio.h>
@@ -19,41 +23,141 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 
-/* ─── Constants ─────────────────────────────────────────────────── */
-#define MAX_NAME     100
-#define MAX_DATA     4096
-#define MAX_CLIENTS  64
-#define MAX_SESSIONS 32
-#define BACKLOG      10
+/* ═══════════════════════════════════════════════════════════════════
+   Constants  –  must match client.c exactly
+   ═══════════════════════════════════════════════════════════════════ */
+#define MAX_NAME        32
+#define MAX_DATA        512
+#define MAX_SESSION_ID  32
+#define BUF_SIZE        620   /* matches client: large enough for full serialized message */
 
-/* ─── Message Types ─────────────────────────────────────────────── */
-#define LOGIN       1
-#define LO_ACK      2
-#define LO_NAK      3
-#define EXIT        4
-#define JOIN        5
-#define JN_ACK      6
-#define JN_NAK      7
-#define LEAVE_SESS  8
-#define NEW_SESS    9
-#define NS_ACK      10
-#define MESSAGE     11
-#define QUERY       12
-#define QU_ACK      13
+#define MAX_CLIENTS     64
+#define MAX_SESSIONS    32
+#define BACKLOG         10
 
-/* ─── Message Structure ──────────────────────────────────────────── */
+/* ═══════════════════════════════════════════════════════════════════
+   Packet type codes  –  enum starting at 0, matches client.c exactly
+   ═══════════════════════════════════════════════════════════════════ */
+typedef enum {
+    LOGIN = 0,
+    LO_ACK,
+    LO_NAK,
+    EXIT,
+    JOIN,
+    JN_ACK,
+    JN_NAK,
+    LEAVE_SESS,
+    NEW_SESS,
+    NS_ACK,
+    MESSAGE,
+    QUERY,
+    QU_ACK
+} message_t;
+
+/* ═══════════════════════════════════════════════════════════════════
+   Message struct  –  matches client.c exactly (includes session_id)
+   ═══════════════════════════════════════════════════════════════════ */
 struct message {
-    unsigned int  type;
-    unsigned int  size;
-    unsigned char source[MAX_NAME];
-    unsigned char data[MAX_DATA];
+    unsigned int type;
+    unsigned int size;
+    char         source[MAX_NAME];
+    char         session_id[MAX_SESSION_ID];
+    char         data[MAX_DATA];
 };
 
-/* ─── Hard-coded user database ───────────────────────────────────── */
-typedef struct {
-    char id[MAX_NAME];
-    char password[MAX_NAME];
-} UserRecord;
+/* ═══════════════════════════════════════════════════════════════════
+   Serialization / Deserialization  –  "type:size:source:session_id:data"
+   Matches client.c's message_to_string / parse_message exactly.
+   ═══════════════════════════════════════════════════════════════════ */
+static void message_to_string(const struct message *m, char *dest)
+{
+    memset(dest, 0, BUF_SIZE);
+    snprintf(dest, BUF_SIZE, "%d:%d:%s:%s:%s",
+             m->type, m->size, m->source, m->session_id, m->data);
+}
+
+static void parse_message(const char *src, struct message *m)
+{
+    memset(m, 0, sizeof *m);
+
+    char tmp[BUF_SIZE];
+    strncpy(tmp, src, BUF_SIZE - 1);
+
+    char *tok;
+
+    tok = strtok(tmp, ":");
+    if (!tok) return;
+    m->type = (unsigned int)atoi(tok);
+
+    tok = strtok(NULL, ":");
+    if (!tok) return;
+    m->size = (unsigned int)atoi(tok);
+
+    tok = strtok(NULL, ":");
+    if (!tok) return;
+    strncpy(m->source, tok, MAX_NAME - 1);
+
+    tok = strtok(NULL, ":");
+    if (!tok) return;
+    strncpy(m->session_id, tok, MAX_SESSION_ID - 1);
+
+    /* data may contain ':', so take the rest of the original string directly */
+    const char *p = src;
+    int colons = 0;
+    while (*p && colons < 4) {
+        if (*p == ':') colons++;
+        p++;
+    }
+    strncpy(m->data, p, MAX_DATA - 1);
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   Send / Receive helpers
+   ═══════════════════════════════════════════════════════════════════ */
+
+/* Serialize and send one message to fd. Returns 0 on success, -1 on error. */
+static int send_msg(int fd, const struct message *m)
+{
+    char buf[BUF_SIZE];
+    message_to_string(m, buf);
+    if (send(fd, buf, BUF_SIZE, 0) == -1) {
+        perror("send");
+        return -1;
+    }
+    return 0;
+}
+
+/* Receive and deserialize one message from fd.
+   Returns bytes read (>0) on success, 0 if connection closed, -1 on error. */
+static int recv_msg(int fd, struct message *m)
+{
+    char buf[BUF_SIZE];
+    memset(buf, 0, sizeof buf);
+    int n = recv(fd, buf, BUF_SIZE - 1, 0);
+    if (n <= 0) return n;
+    buf[n] = '\0';
+    parse_message(buf, m);
+    return n;
+}
+
+/* Convenience: build and send a response in one call */
+static void respond(int fd, message_t type,
+                    const char *session_id, const char *data)
+{
+    struct message resp;
+    memset(&resp, 0, sizeof resp);
+    resp.type = (unsigned int)type;
+    strncpy(resp.source,     "server",     MAX_NAME       - 1);
+    strncpy(resp.session_id, session_id,   MAX_SESSION_ID - 1);
+    strncpy(resp.data,       data,         MAX_DATA       - 1);
+    resp.size = (unsigned int)strlen(resp.data);
+    send_msg(fd, &resp);
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   Hard-coded user database
+   ═══════════════════════════════════════════════════════════════════ */
+typedef struct { char id[MAX_NAME]; char password[MAX_NAME]; } UserRecord;
 
 static UserRecord user_db[] = {
     { "jill",  "eW94dsol" },
@@ -62,85 +166,30 @@ static UserRecord user_db[] = {
     { "bob",   "qwerty"   },
     { "carol", "hello99"  },
 };
-static const int USER_DB_SIZE = sizeof(user_db) / sizeof(user_db[0]);
+static const int USER_DB_SIZE = (int)(sizeof user_db / sizeof user_db[0]);
 
-/* ─── Connected client table ─────────────────────────────────────── */
-typedef struct {
-    int  fd;                    /* socket file descriptor, -1 = empty slot */
-    char id[MAX_NAME];          /* client identifier                        */
-    char session_id[MAX_NAME];  /* current session, empty string = none     */
-    char ip[INET6_ADDRSTRLEN];  /* IP address string                        */
-    int  port;                  /* port number                              */
-} Client;
-
-static Client clients[MAX_CLIENTS];
-static int    num_clients = 0;  /* number of currently connected clients    */
-
-/* ─── Session table ─────────────────────────────────────────────── */
-typedef struct {
-    char name[MAX_NAME];        /* session ID, empty string = unused slot   */
-} Session;
-
-static Session sessions[MAX_SESSIONS];
-
-/* ─── Utility: send a full message struct to a socket ───────────── */
-/*
- * We prefix every message with a 4-byte network-order length so that
- * the receiver can reconstruct message boundaries over TCP's byte stream.
- */
-static int send_message(int fd, struct message *msg)
+static int check_credentials(const char *id, const char *pw)
 {
-    /* Total payload size */
-    uint32_t payload_len = sizeof(struct message);
-    uint32_t net_len     = htonl(payload_len);
-
-    /* Send length prefix */
-    if (send(fd, &net_len, sizeof(net_len), 0) < 0) {
-        perror("send (length prefix)");
-        return -1;
-    }
-    /* Send message body */
-    size_t  total_sent = 0;
-    uint8_t *buf       = (uint8_t *)msg;
-    while (total_sent < payload_len) {
-        ssize_t n = send(fd, buf + total_sent, payload_len - total_sent, 0);
-        if (n <= 0) {
-            perror("send (body)");
-            return -1;
-        }
-        total_sent += n;
-    }
+    for (int i = 0; i < USER_DB_SIZE; i++)
+        if (strcmp(user_db[i].id, id) == 0 &&
+            strcmp(user_db[i].password, pw) == 0)
+            return 1;
     return 0;
 }
 
-/* ─── Utility: receive a full message struct from a socket ──────── */
-static int recv_message(int fd, struct message *msg)
-{
-    /* Read 4-byte length prefix */
-    uint32_t net_len;
-    ssize_t  n = recv(fd, &net_len, sizeof(net_len), MSG_WAITALL);
-    if (n == 0)  return 0;   /* connection closed */
-    if (n < 0) { perror("recv (length prefix)"); return -1; }
+/* ═══════════════════════════════════════════════════════════════════
+   Connected-client table
+   ═══════════════════════════════════════════════════════════════════ */
+typedef struct {
+    int  fd;                        /* -1 = empty slot          */
+    char id[MAX_NAME];
+    char session_id[MAX_SESSION_ID]; /* "" = not in any session  */
+    char ip[INET6_ADDRSTRLEN];
+    int  port;
+} Client;
 
-    uint32_t payload_len = ntohl(net_len);
-    if (payload_len != sizeof(struct message)) {
-        fprintf(stderr, "recv_message: unexpected payload size %u\n", payload_len);
-        return -1;
-    }
+static Client clients[MAX_CLIENTS];
 
-    /* Read message body */
-    size_t  total_recv = 0;
-    uint8_t *buf       = (uint8_t *)msg;
-    while (total_recv < payload_len) {
-        n = recv(fd, buf + total_recv, payload_len - total_recv, 0);
-        if (n == 0)  return 0;
-        if (n < 0) { perror("recv (body)"); return -1; }
-        total_recv += n;
-    }
-    return (int)total_recv;
-}
-
-/* ─── Utility: find client slot by fd ───────────────────────────── */
 static Client *find_client_by_fd(int fd)
 {
     for (int i = 0; i < MAX_CLIENTS; i++)
@@ -148,7 +197,6 @@ static Client *find_client_by_fd(int fd)
     return NULL;
 }
 
-/* ─── Utility: find client slot by ID ───────────────────────────── */
 static Client *find_client_by_id(const char *id)
 {
     for (int i = 0; i < MAX_CLIENTS; i++)
@@ -157,7 +205,6 @@ static Client *find_client_by_id(const char *id)
     return NULL;
 }
 
-/* ─── Utility: find a free client slot ──────────────────────────── */
 static Client *alloc_client_slot(void)
 {
     for (int i = 0; i < MAX_CLIENTS; i++)
@@ -165,505 +212,397 @@ static Client *alloc_client_slot(void)
     return NULL;
 }
 
-/* ─── Utility: find session by name ─────────────────────────────── */
+/* ═══════════════════════════════════════════════════════════════════
+   Session table
+   ═══════════════════════════════════════════════════════════════════ */
+typedef struct {
+    char name[MAX_SESSION_ID];  /* "" = unused slot */
+} Session;
+
+static Session sessions[MAX_SESSIONS];
+
 static Session *find_session(const char *name)
 {
     for (int i = 0; i < MAX_SESSIONS; i++)
-        if (strlen(sessions[i].name) > 0 &&
+        if (sessions[i].name[0] != '\0' &&
             strcmp(sessions[i].name, name) == 0)
             return &sessions[i];
     return NULL;
 }
 
-/* ─── Utility: find free session slot ───────────────────────────── */
 static Session *alloc_session_slot(void)
 {
     for (int i = 0; i < MAX_SESSIONS; i++)
-        if (strlen(sessions[i].name) == 0) return &sessions[i];
+        if (sessions[i].name[0] == '\0') return &sessions[i];
     return NULL;
 }
 
-/* ─── Utility: delete a session if no clients remain in it ──────── */
+/* Delete a session if no clients remain in it */
 static void maybe_delete_session(const char *name)
 {
-    /* Check if anyone is still in this session */
-    for (int i = 0; i < MAX_CLIENTS; i++) {
+    for (int i = 0; i < MAX_CLIENTS; i++)
         if (clients[i].fd != -1 &&
             strcmp(clients[i].session_id, name) == 0)
-            return;  /* still occupied */
-    }
-    /* Remove session */
+            return; /* still has members */
+
     for (int i = 0; i < MAX_SESSIONS; i++) {
         if (strcmp(sessions[i].name, name) == 0) {
-            memset(sessions[i].name, 0, sizeof(sessions[i].name));
-            printf("[server] Session '%s' deleted (empty).\n", name);
+            memset(sessions[i].name, 0, sizeof sessions[i].name);
+            printf("[server] Session '%s' deleted (no members left).\n", name);
             return;
         }
     }
 }
 
-/* ─── Utility: multicast MESSAGE to all clients in a session ─────── */
-static void broadcast_to_session(const char *session_id, struct message *msg)
+/* Multicast a message to every client in a session */
+static void broadcast(const char *session_id, struct message *msg)
 {
-    for (int i = 0; i < MAX_CLIENTS; i++) {
+    for (int i = 0; i < MAX_CLIENTS; i++)
         if (clients[i].fd != -1 &&
-            strcmp(clients[i].session_id, session_id) == 0) {
-            if (send_message(clients[i].fd, msg) < 0)
-                fprintf(stderr, "[server] Failed to forward to %s\n",
-                        clients[i].id);
-        }
-    }
+            strcmp(clients[i].session_id, session_id) == 0)
+            send_msg(clients[i].fd, msg);
 }
 
-/* ─── Utility: look up password in user_db ───────────────────────── */
-static int check_credentials(const char *id, const char *password)
-{
-    for (int i = 0; i < USER_DB_SIZE; i++)
-        if (strcmp(user_db[i].id, id) == 0 &&
-            strcmp(user_db[i].password, password) == 0)
-            return 1;
-    return 0;
-}
-
-/* ─── Disconnect / cleanup a client ─────────────────────────────── */
-static void disconnect_client(int fd, fd_set *master_fds, int *fd_max)
+/* ═══════════════════════════════════════════════════════════════════
+   Disconnect / cleanup
+   ═══════════════════════════════════════════════════════════════════ */
+static void disconnect_client(int fd, fd_set *master, int *fd_max)
 {
     Client *c = find_client_by_fd(fd);
     if (!c) return;
 
-    printf("[server] Client '%s' (fd=%d) disconnected.\n",
-           strlen(c->id) ? c->id : "(unknown)", fd);
+    printf("[server] '%s' (fd=%d) disconnected.\n",
+           c->id[0] ? c->id : "(unknown)", fd);
 
-    /* Leave session if in one */
-    if (strlen(c->session_id) > 0)
+    if (c->session_id[0] != '\0')
         maybe_delete_session(c->session_id);
 
-    /* Remove from master set */
-    FD_CLR(fd, master_fds);
-    if (fd == *fd_max) {
-        while (*fd_max > 0 && !FD_ISSET(*fd_max, master_fds))
+    FD_CLR(fd, master);
+    if (fd == *fd_max)
+        while (*fd_max > 0 && !FD_ISSET(*fd_max, master))
             (*fd_max)--;
-    }
 
     close(fd);
-
-    /* Clear slot */
-    memset(c, 0, sizeof(Client));
+    memset(c, 0, sizeof *c);
     c->fd = -1;
-    num_clients--;
 }
 
-/* ─── Handle LOGIN ──────────────────────────────────────────────── */
+/* ═══════════════════════════════════════════════════════════════════
+   Message handlers
+   ═══════════════════════════════════════════════════════════════════ */
+
+/* LOGIN */
 static void handle_login(int fd, struct message *msg,
-                         fd_set *master_fds, int *fd_max)
+                          fd_set *master, int *fd_max)
 {
-    struct message resp;
-    memset(&resp, 0, sizeof(resp));
+    const char *id = msg->source;
+    const char *pw = msg->data;
 
-    char *id  = (char *)msg->source;
-    char *pw  = (char *)msg->data;
-
-    /* Check if ID already connected */
     if (find_client_by_id(id)) {
-        resp.type = LO_NAK;
-        snprintf((char *)resp.data, MAX_DATA,
-                 "ID '%s' is already logged in.", id);
-        resp.size = (unsigned int)strlen((char *)resp.data);
-        strncpy((char *)resp.source, "server", MAX_NAME - 1);
-        send_message(fd, &resp);
-        printf("[server] LOGIN denied for '%s': already connected.\n", id);
+        char reason[MAX_DATA];
+        snprintf(reason, sizeof reason, "ID '%s' is already logged in.", id);
+        respond(fd, LO_NAK, "", reason);
+        printf("[server] LOGIN denied '%s': already connected.\n", id);
         return;
     }
 
-    /* Validate credentials */
     if (!check_credentials(id, pw)) {
-        resp.type = LO_NAK;
-        snprintf((char *)resp.data, MAX_DATA,
-                 "Invalid ID or password.");
-        resp.size = (unsigned int)strlen((char *)resp.data);
-        strncpy((char *)resp.source, "server", MAX_NAME - 1);
-        send_message(fd, &resp);
-        printf("[server] LOGIN denied for '%s': bad credentials.\n", id);
+        respond(fd, LO_NAK, "", "Invalid ID or password.");
+        printf("[server] LOGIN denied '%s': bad credentials.\n", id);
         return;
     }
 
-    /* Register client */
+    /* Register (slot was pre-allocated on accept) */
     Client *c = find_client_by_fd(fd);
     if (!c) {
-        /* fd was accepted but slot not yet assigned – find free slot */
-        c = alloc_client_slot();
-        if (!c) {
-            resp.type = LO_NAK;
-            snprintf((char *)resp.data, MAX_DATA, "Server full.");
-            resp.size = (unsigned int)strlen((char *)resp.data);
-            strncpy((char *)resp.source, "server", MAX_NAME - 1);
-            send_message(fd, &resp);
-            return;
-        }
-        c->fd = fd;
+        respond(fd, LO_NAK, "", "Server error: no slot for fd.");
+        return;
     }
     strncpy(c->id, id, MAX_NAME - 1);
-    memset(c->session_id, 0, sizeof(c->session_id));
-    num_clients++;
 
-    resp.type = LO_ACK;
-    resp.size = 0;
-    strncpy((char *)resp.source, "server", MAX_NAME - 1);
-    send_message(fd, &resp);
-    printf("[server] '%s' logged in successfully.\n", id);
+    respond(fd, LO_ACK, "", "");
+    printf("[server] '%s' logged in.\n", id);
+
+    (void)master; (void)fd_max; /* unused here, kept for signature symmetry */
 }
 
-/* ─── Handle EXIT ────────────────────────────────────────────────── */
-static void handle_exit(int fd, fd_set *master_fds, int *fd_max)
+/* EXIT */
+static void handle_exit(int fd, fd_set *master, int *fd_max)
 {
-    disconnect_client(fd, master_fds, fd_max);
+    disconnect_client(fd, master, fd_max);
 }
 
-/* ─── Handle JOIN ────────────────────────────────────────────────── */
+/* JOIN */
 static void handle_join(int fd, struct message *msg)
 {
-    struct message resp;
-    memset(&resp, 0, sizeof(resp));
-    strncpy((char *)resp.source, "server", MAX_NAME - 1);
-
     Client *c = find_client_by_fd(fd);
-    if (!c || strlen(c->id) == 0) {
-        /* Not logged in */
-        resp.type = JN_NAK;
-        snprintf((char *)resp.data, MAX_DATA,
-                 "%s,Not logged in.", (char *)msg->data);
-        resp.size = (unsigned int)strlen((char *)resp.data);
-        send_message(fd, &resp);
+    const char *sess = msg->session_id;  /* client puts session ID here */
+
+    if (!c || c->id[0] == '\0') {
+        char nak[MAX_DATA];
+        snprintf(nak, sizeof nak, "%s,Not logged in.", sess);
+        respond(fd, JN_NAK, sess, nak);
+        return;
+    }
+    if (c->session_id[0] != '\0') {
+        char nak[MAX_DATA];
+        snprintf(nak, sizeof nak, "%s,Already in session '%s'.",
+                 sess, c->session_id);
+        respond(fd, JN_NAK, sess, nak);
+        return;
+    }
+    if (!find_session(sess)) {
+        char nak[MAX_DATA];
+        snprintf(nak, sizeof nak, "%s,Session does not exist.", sess);
+        respond(fd, JN_NAK, sess, nak);
         return;
     }
 
-    char *sess_id = (char *)msg->data;
-
-    /* Already in a session? */
-    if (strlen(c->session_id) > 0) {
-        resp.type = JN_NAK;
-        snprintf((char *)resp.data, MAX_DATA,
-                 "%s,Already in session '%s'. Leave first.",
-                 sess_id, c->session_id);
-        resp.size = (unsigned int)strlen((char *)resp.data);
-        send_message(fd, &resp);
-        return;
-    }
-
-    /* Does session exist? */
-    Session *s = find_session(sess_id);
-    if (!s) {
-        resp.type = JN_NAK;
-        snprintf((char *)resp.data, MAX_DATA,
-                 "%s,Session does not exist.", sess_id);
-        resp.size = (unsigned int)strlen((char *)resp.data);
-        send_message(fd, &resp);
-        return;
-    }
-
-    /* Join */
-    strncpy(c->session_id, sess_id, MAX_NAME - 1);
-    resp.type = JN_ACK;
-    strncpy((char *)resp.data, sess_id, MAX_DATA - 1);
-    resp.size = (unsigned int)strlen(sess_id);
-    send_message(fd, &resp);
-    printf("[server] '%s' joined session '%s'.\n", c->id, sess_id);
+    strncpy(c->session_id, sess, MAX_SESSION_ID - 1);
+    respond(fd, JN_ACK, sess, sess);
+    printf("[server] '%s' joined session '%s'.\n", c->id, sess);
 }
 
-/* ─── Handle LEAVE_SESS ─────────────────────────────────────────── */
+/* LEAVE_SESS */
 static void handle_leave_sess(int fd)
 {
     Client *c = find_client_by_fd(fd);
-    if (!c || strlen(c->session_id) == 0) {
+    if (!c || c->session_id[0] == '\0') {
         printf("[server] LEAVE_SESS from fd=%d but not in a session.\n", fd);
         return;
     }
-
-    char old_sess[MAX_NAME];
-    strncpy(old_sess, c->session_id, MAX_NAME - 1);
-    memset(c->session_id, 0, sizeof(c->session_id));
-
-    printf("[server] '%s' left session '%s'.\n", c->id, old_sess);
-    maybe_delete_session(old_sess);
+    char old[MAX_SESSION_ID];
+    strncpy(old, c->session_id, MAX_SESSION_ID - 1);
+    memset(c->session_id, 0, sizeof c->session_id);
+    printf("[server] '%s' left session '%s'.\n", c->id, old);
+    maybe_delete_session(old);
 }
 
-/* ─── Handle NEW_SESS ───────────────────────────────────────────── */
+/* NEW_SESS */
 static void handle_new_sess(int fd, struct message *msg)
 {
-    struct message resp;
-    memset(&resp, 0, sizeof(resp));
-    strncpy((char *)resp.source, "server", MAX_NAME - 1);
-
     Client *c = find_client_by_fd(fd);
-    if (!c || strlen(c->id) == 0) {
-        resp.type = JN_NAK;
-        snprintf((char *)resp.data, MAX_DATA,
-                 "%s,Not logged in.", (char *)msg->data);
-        resp.size = (unsigned int)strlen((char *)resp.data);
-        send_message(fd, &resp);
+    const char *sess = msg->session_id;  /* client puts session ID here */
+
+    if (!c || c->id[0] == '\0') {
+        char nak[MAX_DATA];
+        snprintf(nak, sizeof nak, "%s,Not logged in.", sess);
+        respond(fd, JN_NAK, sess, nak);
+        return;
+    }
+    if (c->session_id[0] != '\0') {
+        char nak[MAX_DATA];
+        snprintf(nak, sizeof nak, "%s,Already in session '%s'.",
+                 sess, c->session_id);
+        respond(fd, JN_NAK, sess, nak);
+        return;
+    }
+    if (find_session(sess)) {
+        char nak[MAX_DATA];
+        snprintf(nak, sizeof nak, "%s,Session already exists.", sess);
+        respond(fd, JN_NAK, sess, nak);
         return;
     }
 
-    char *sess_id = (char *)msg->data;
-
-    /* Already in a session? */
-    if (strlen(c->session_id) > 0) {
-        resp.type = JN_NAK;
-        snprintf((char *)resp.data, MAX_DATA,
-                 "%s,Already in session '%s'. Leave first.",
-                 sess_id, c->session_id);
-        resp.size = (unsigned int)strlen((char *)resp.data);
-        send_message(fd, &resp);
-        return;
-    }
-
-    /* Session name already taken? */
-    if (find_session(sess_id)) {
-        resp.type = JN_NAK;
-        snprintf((char *)resp.data, MAX_DATA,
-                 "%s,Session already exists.", sess_id);
-        resp.size = (unsigned int)strlen((char *)resp.data);
-        send_message(fd, &resp);
-        return;
-    }
-
-    /* Allocate session */
     Session *s = alloc_session_slot();
     if (!s) {
-        resp.type = JN_NAK;
-        snprintf((char *)resp.data, MAX_DATA,
-                 "%s,Maximum sessions reached.", sess_id);
-        resp.size = (unsigned int)strlen((char *)resp.data);
-        send_message(fd, &resp);
+        char nak[MAX_DATA];
+        snprintf(nak, sizeof nak, "%s,Max sessions reached.", sess);
+        respond(fd, JN_NAK, sess, nak);
         return;
     }
-    strncpy(s->name, sess_id, MAX_NAME - 1);
+    strncpy(s->name, sess, MAX_SESSION_ID - 1);
+    strncpy(c->session_id, sess, MAX_SESSION_ID - 1);
 
-    /* Join the creator into the session */
-    strncpy(c->session_id, sess_id, MAX_NAME - 1);
-
-    resp.type = NS_ACK;
-    strncpy((char *)resp.data, sess_id, MAX_DATA - 1);
-    resp.size = (unsigned int)strlen(sess_id);
-    send_message(fd, &resp);
-    printf("[server] '%s' created and joined session '%s'.\n",
-           c->id, sess_id);
+    respond(fd, NS_ACK, sess, sess);
+    printf("[server] '%s' created session '%s'.\n", c->id, sess);
 }
 
-/* ─── Handle MESSAGE ────────────────────────────────────────────── */
+/* MESSAGE  –  multicast to all session members */
 static void handle_message(int fd, struct message *msg)
 {
     Client *c = find_client_by_fd(fd);
-    if (!c || strlen(c->id) == 0) return;
-
-    if (strlen(c->session_id) == 0) {
-        printf("[server] MESSAGE from '%s' who is not in a session – ignored.\n",
+    if (!c || c->id[0] == '\0') return;
+    if (c->session_id[0] == '\0') {
+        printf("[server] MESSAGE from '%s' not in a session – ignored.\n",
                c->id);
         return;
     }
-
-    /* Forward to all clients in the same session (including sender) */
-    broadcast_to_session(c->session_id, msg);
+    broadcast(c->session_id, msg);
 }
 
-/* ─── Handle QUERY ──────────────────────────────────────────────── */
+/* QUERY */
 static void handle_query(int fd)
 {
-    struct message resp;
-    memset(&resp, 0, sizeof(resp));
-    resp.type = QU_ACK;
-    strncpy((char *)resp.source, "server", MAX_NAME - 1);
-
-    /* Build list: "Users: u1 u2 ... \nSessions: s1 s2 ..." */
     char buf[MAX_DATA];
-    int  offset = 0;
+    int  off = 0;
 
-    offset += snprintf(buf + offset, sizeof(buf) - offset, "Users: ");
-    for (int i = 0; i < MAX_CLIENTS; i++) {
-        if (clients[i].fd != -1 && strlen(clients[i].id) > 0) {
-            offset += snprintf(buf + offset, sizeof(buf) - offset,
-                               "%s ", clients[i].id);
-        }
-    }
+    off += snprintf(buf + off, sizeof buf - off, "Users: ");
+    for (int i = 0; i < MAX_CLIENTS; i++)
+        if (clients[i].fd != -1 && clients[i].id[0] != '\0')
+            off += snprintf(buf + off, sizeof buf - off,
+                            "%s ", clients[i].id);
 
-    offset += snprintf(buf + offset, sizeof(buf) - offset, "\nSessions: ");
-    for (int i = 0; i < MAX_SESSIONS; i++) {
-        if (strlen(sessions[i].name) > 0) {
-            offset += snprintf(buf + offset, sizeof(buf) - offset,
-                               "%s ", sessions[i].name);
-        }
-    }
+    off += snprintf(buf + off, sizeof buf - off, "\nSessions: ");
+    for (int i = 0; i < MAX_SESSIONS; i++)
+        if (sessions[i].name[0] != '\0')
+            off += snprintf(buf + off, sizeof buf - off,
+                            "%s ", sessions[i].name);
 
-    strncpy((char *)resp.data, buf, MAX_DATA - 1);
-    resp.size = (unsigned int)strlen(buf);
-    send_message(fd, &resp);
+    respond(fd, QU_ACK, "", buf);
 }
 
-/* ─── Dispatch incoming message from an existing client ─────────── */
-static void handle_client_message(int fd, fd_set *master_fds, int *fd_max)
+/* ═══════════════════════════════════════════════════════════════════
+   Dispatch one incoming packet from an existing client fd
+   ═══════════════════════════════════════════════════════════════════ */
+static void dispatch(int fd, fd_set *master, int *fd_max)
 {
     struct message msg;
-    memset(&msg, 0, sizeof(msg));
+    int n = recv_msg(fd, &msg);
 
-    int n = recv_message(fd, &msg);
     if (n == 0) {
-        /* Connection closed cleanly */
-        disconnect_client(fd, master_fds, fd_max);
+        /* peer closed connection cleanly */
+        disconnect_client(fd, master, fd_max);
         return;
     }
     if (n < 0) {
-        fprintf(stderr, "[server] recv error on fd=%d, disconnecting.\n", fd);
-        disconnect_client(fd, master_fds, fd_max);
+        fprintf(stderr, "[server] recv error fd=%d, disconnecting.\n", fd);
+        disconnect_client(fd, master, fd_max);
         return;
     }
 
-    switch (msg.type) {
-        case LOGIN:      handle_login(fd, &msg, master_fds, fd_max); break;
-        case EXIT:       handle_exit(fd, master_fds, fd_max);        break;
-        case JOIN:       handle_join(fd, &msg);                      break;
-        case LEAVE_SESS: handle_leave_sess(fd);                      break;
-        case NEW_SESS:   handle_new_sess(fd, &msg);                  break;
-        case MESSAGE:    handle_message(fd, &msg);                   break;
-        case QUERY:      handle_query(fd);                           break;
+    switch ((message_t)msg.type) {
+        case LOGIN:      handle_login(fd, &msg, master, fd_max); break;
+        case EXIT:       handle_exit(fd, master, fd_max);        break;
+        case JOIN:       handle_join(fd, &msg);                  break;
+        case LEAVE_SESS: handle_leave_sess(fd);                  break;
+        case NEW_SESS:   handle_new_sess(fd, &msg);              break;
+        case MESSAGE:    handle_message(fd, &msg);               break;
+        case QUERY:      handle_query(fd);                       break;
         default:
-            printf("[server] Unknown message type %u from fd=%d.\n",
-                   msg.type, fd);
+            printf("[server] Unknown type %u from fd=%d.\n", msg.type, fd);
     }
 }
 
-/* ─── main ──────────────────────────────────────────────────────── */
+/* ═══════════════════════════════════════════════════════════════════
+   main
+   ═══════════════════════════════════════════════════════════════════ */
 int main(int argc, char *argv[])
 {
     if (argc != 2) {
         fprintf(stderr, "Usage: %s <port>\n", argv[0]);
         exit(EXIT_FAILURE);
     }
+    const char *port = argv[1];
 
-    const char *port_str = argv[1];
-
-    /* Initialise client table */
+    /* Initialise tables */
     for (int i = 0; i < MAX_CLIENTS; i++) {
-        memset(&clients[i], 0, sizeof(Client));
+        memset(&clients[i], 0, sizeof clients[i]);
         clients[i].fd = -1;
     }
-    /* Initialise session table */
-    memset(sessions, 0, sizeof(sessions));
+    memset(sessions, 0, sizeof sessions);
 
-    /* ── Set up listening socket ─────────────────────────────────── */
+    /* ── Create listener socket ───────────────────────────────────── */
     struct addrinfo hints, *res, *p;
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family   = AF_UNSPEC;   /* IPv4 or IPv6 */
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family   = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
-    hints.ai_flags    = AI_PASSIVE;  /* use local IP */
+    hints.ai_flags    = AI_PASSIVE;
 
-    int rv = getaddrinfo(NULL, port_str, &hints, &res);
+    int rv = getaddrinfo(NULL, port, &hints, &res);
     if (rv != 0) {
         fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(rv));
         exit(EXIT_FAILURE);
     }
 
-    int listener_fd = -1;
+    int listener = -1;
     for (p = res; p != NULL; p = p->ai_next) {
-        listener_fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
-        if (listener_fd < 0) continue;
+        listener = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+        if (listener < 0) continue;
 
-        /* Allow address reuse to avoid "port in use" after restart */
         int yes = 1;
-        setsockopt(listener_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+        setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof yes);
 
-        if (bind(listener_fd, p->ai_addr, p->ai_addrlen) < 0) {
-            close(listener_fd);
+        if (bind(listener, p->ai_addr, p->ai_addrlen) < 0) {
+            close(listener);
+            listener = -1;
             continue;
         }
         break;
     }
     freeaddrinfo(res);
 
-    if (p == NULL) {
-        fprintf(stderr, "[server] Failed to bind to port %s.\n", port_str);
+    if (listener < 0) {
+        fprintf(stderr, "[server] Failed to bind on port %s\n", port);
         exit(EXIT_FAILURE);
     }
-
-    if (listen(listener_fd, BACKLOG) < 0) {
+    if (listen(listener, BACKLOG) < 0) {
         perror("listen");
         exit(EXIT_FAILURE);
     }
-    printf("[server] Listening on port %s ...\n", port_str);
+    printf("[server] Listening on port %s ...\n", port);
 
-    /* ── select() main loop ──────────────────────────────────────── */
-    fd_set master_fds;   /* all active FDs            */
-    fd_set read_fds;     /* working copy for select() */
-    FD_ZERO(&master_fds);
-    FD_ZERO(&read_fds);
+    /* ── select() loop ────────────────────────────────────────────── */
+    fd_set master, rfds;
+    FD_ZERO(&master);
+    FD_SET(listener, &master);
+    int fd_max = listener;
 
-    FD_SET(listener_fd, &master_fds);
-    int fd_max = listener_fd;
-
-    while (1) {
-        read_fds = master_fds;   /* select() modifies the set, so copy each time */
-
-        if (select(fd_max + 1, &read_fds, NULL, NULL, NULL) < 0) {
-            if (errno == EINTR) continue;  /* interrupted by signal, retry */
+    for (;;) {
+        rfds = master;
+        if (select(fd_max + 1, &rfds, NULL, NULL, NULL) < 0) {
+            if (errno == EINTR) continue;
             perror("select");
             exit(EXIT_FAILURE);
         }
 
-        /* Iterate over all possible FDs */
         for (int fd = 0; fd <= fd_max; fd++) {
-            if (!FD_ISSET(fd, &read_fds)) continue;
+            if (!FD_ISSET(fd, &rfds)) continue;
 
-            if (fd == listener_fd) {
-                /* ── New incoming connection ──────────────────────── */
-                struct sockaddr_storage peer_addr;
-                socklen_t peer_addrlen = sizeof(peer_addr);
-                int new_fd = accept(listener_fd,
-                                    (struct sockaddr *)&peer_addr,
-                                    &peer_addrlen);
-                if (new_fd < 0) {
-                    perror("accept");
-                    continue;
-                }
+            if (fd == listener) {
+                /* ── Accept new connection ────────────────────────── */
+                struct sockaddr_storage addr;
+                socklen_t addrlen = sizeof addr;
+                int new_fd = accept(listener,
+                                    (struct sockaddr *)&addr, &addrlen);
+                if (new_fd < 0) { perror("accept"); continue; }
 
-                /* Check capacity */
                 Client *slot = alloc_client_slot();
                 if (!slot) {
                     fprintf(stderr,
-                            "[server] Max clients reached, rejecting fd=%d.\n",
-                            new_fd);
+                            "[server] Max clients reached, rejecting.\n");
                     close(new_fd);
                     continue;
                 }
 
-                /* Pre-register slot with fd (ID filled in upon LOGIN) */
                 slot->fd = new_fd;
 
-                /* Store peer IP and port */
-                void *addr_ptr;
-                if (peer_addr.ss_family == AF_INET) {
-                    struct sockaddr_in *s = (struct sockaddr_in *)&peer_addr;
-                    addr_ptr   = &s->sin_addr;
-                    slot->port = ntohs(s->sin_port);
+                /* Record peer IP / port */
+                void *addr_in;
+                if (addr.ss_family == AF_INET) {
+                    struct sockaddr_in *s4 = (struct sockaddr_in *)&addr;
+                    addr_in    = &s4->sin_addr;
+                    slot->port = ntohs(s4->sin_port);
                 } else {
-                    struct sockaddr_in6 *s = (struct sockaddr_in6 *)&peer_addr;
-                    addr_ptr   = &s->sin6_addr;
-                    slot->port = ntohs(s->sin6_port);
+                    struct sockaddr_in6 *s6 = (struct sockaddr_in6 *)&addr;
+                    addr_in    = &s6->sin6_addr;
+                    slot->port = ntohs(s6->sin6_port);
                 }
-                inet_ntop(peer_addr.ss_family, addr_ptr,
-                          slot->ip, sizeof(slot->ip));
+                inet_ntop(addr.ss_family, addr_in, slot->ip, sizeof slot->ip);
 
-                FD_SET(new_fd, &master_fds);
+                FD_SET(new_fd, &master);
                 if (new_fd > fd_max) fd_max = new_fd;
 
                 printf("[server] New connection from %s:%d (fd=%d).\n",
                        slot->ip, slot->port, new_fd);
 
             } else {
-                /* ── Data from existing client ────────────────────── */
-                handle_client_message(fd, &master_fds, &fd_max);
+                /* ── Existing client sent something ──────────────── */
+                dispatch(fd, &master, &fd_max);
             }
         }
     }
 
-    close(listener_fd);
+    close(listener);
     return 0;
 }
