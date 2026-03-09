@@ -15,8 +15,7 @@
    ═══════════════════════════════════════════════ */
 #define MAX_NAME        32
 #define MAX_DATA        512
-#define MAX_SESSION_ID  32
-#define BUF_SIZE        620
+#define BUF_SIZE        580   /* fixed: no session_id field anymore */
 #define MAX_CLIENTS     100
 #define MAX_SESSIONS    100
 
@@ -36,23 +35,33 @@ typedef enum {
     QU_ACK
 } message_t;
 
+/* exact struct from lab spec — no session_id field
+   data carries different things depending on packet type:
+     LOGIN    → password
+     JOIN     → session ID to join
+     JN_ACK   → session ID that was joined
+     JN_NAK   → reason for failure
+     NEW_SESS → session ID to create
+     NS_ACK   → session ID that was created
+     MESSAGE  → chat text
+     QU_ACK   → list of users and sessions              */
 struct message {
     unsigned int  type;
     unsigned int  size;
-    char          source[MAX_NAME];
-    char          session_id[MAX_SESSION_ID];
-    char          data[MAX_DATA];
+    unsigned char source[MAX_NAME];
+    unsigned char data[MAX_DATA];
 };
 
 /* ═══════════════════════════════════════════════
-   Serialization – same as client
-   "type:size:source:session:data"
+   Serialization – "type:size:source:data"  (3 colons, matches client.c)
    ═══════════════════════════════════════════════ */
-static void message_to_string(const struct message *m, char *dest)
+static int message_to_string(const struct message *m, char *dest)
 {
     memset(dest, 0, BUF_SIZE);
-    snprintf(dest, BUF_SIZE, "%d:%d:%s:%s:%s",
-             m->type, m->size, m->source, m->session_id, m->data);
+    /* write type:size:source: prefix, then copy data raw (may contain ':') */
+    int prefix_len = snprintf(dest, BUF_SIZE, "%d:%d:%s:", m->type, m->size, (char *)m->source);
+    memcpy(dest + prefix_len, m->data, m->size);
+    return prefix_len + m->size;
 }
 
 static void parse_message(const char *src, struct message *m)
@@ -75,52 +84,42 @@ static void parse_message(const char *src, struct message *m)
 
     tok = strtok(NULL, ":");
     if (!tok) return;
-    strncpy(m->source, tok, MAX_NAME - 1);
+    strncpy((char *)m->source, tok, MAX_NAME - 1);
 
-    tok = strtok(NULL, ":");
-    if (!tok) return;
-    strncpy(m->session_id, tok, MAX_SESSION_ID - 1);
-
-    /* data = everything after the 4th colon */
+    /* data = everything after the 3rd colon (may contain ':') */
     const char *p = src;
     int colons = 0;
-    while (*p && colons < 4) {
+    while (*p && colons < 3) {
         if (*p == ':') colons++;
         p++;
     }
-    strncpy(m->data, p, MAX_DATA - 1);
+    memcpy(m->data, p, m->size);
 }
 
 static int send_message_struct(int sock, const struct message *m)
 {
     char buf[BUF_SIZE];
-    message_to_string(m, buf);
-
-    int total = 0;
-    while (total < BUF_SIZE) {
-        int n = send(sock, buf + total, BUF_SIZE - total, 0);
-        if (n <= 0) {
-            return -1;
-        }
-        total += n;
+   
+    int len = message_to_string(m, buf);
+    int n = send(sock, buf, len, 0);
+    if (n <= 0) {
+        return -1;
     }
     return 0;
 }
 
 static int send_packet(int sock, message_t type,
                        const char *source,
-                       const char *session_id,
                        const char *data)
 {
     struct message m;
     memset(&m, 0, sizeof m);
     m.type = type;
 
-    if (source)     strncpy(m.source, source, MAX_NAME - 1);
-    if (session_id) strncpy(m.session_id, session_id, MAX_SESSION_ID - 1);
-    if (data)       strncpy(m.data, data, MAX_DATA - 1);
+    if (source) strncpy((char *)m.source, source, MAX_NAME - 1);
+    if (data)   strncpy((char *)m.data,   data,   MAX_DATA - 1);
 
-    m.size = (unsigned int)strlen(m.data);
+    m.size = (unsigned int)strlen((char *)m.data);
 
     return send_message_struct(sock, &m);
 }
@@ -152,16 +151,16 @@ typedef struct {
     int  active;
     int  sockfd;
     char id[MAX_NAME];
-    char session_id[MAX_SESSION_ID];
+    char session_id[MAX_NAME];  /* current session, "" = none */
     int  logged_in;
 } client_info_t;
 
 typedef struct {
     int  active;
-    char session_id[MAX_SESSION_ID];
+    char session_id[MAX_NAME];
 } session_info_t;
 
-static client_info_t clients[MAX_CLIENTS];
+static client_info_t  clients[MAX_CLIENTS];
 static session_info_t sessions[MAX_SESSIONS];
 
 /* ═══════════════════════════════════════════════
@@ -234,7 +233,7 @@ static int create_session_if_needed(const char *session_id)
         if (!sessions[i].active) {
             memset(&sessions[i], 0, sizeof(sessions[i]));
             sessions[i].active = 1;
-            strncpy(sessions[i].session_id, session_id, MAX_SESSION_ID - 1);
+            strncpy(sessions[i].session_id, session_id, MAX_NAME - 1);
             return i;
         }
     }
@@ -268,9 +267,9 @@ static void leave_current_session(int client_idx)
     if (client_idx < 0 || client_idx >= MAX_CLIENTS) return;
     if (!clients[client_idx].active) return;
 
-    char old_session[MAX_SESSION_ID];
+    char old_session[MAX_NAME];
     memset(old_session, 0, sizeof old_session);
-    strncpy(old_session, clients[client_idx].session_id, MAX_SESSION_ID - 1);
+    strncpy(old_session, clients[client_idx].session_id, MAX_NAME - 1);
 
     memset(clients[client_idx].session_id, 0, sizeof(clients[client_idx].session_id));
     delete_session_if_empty(old_session);
@@ -326,24 +325,24 @@ static void handle_login_req(int sockfd, const struct message *req)
     if (cidx == -1) return;
 
     if (clients[cidx].logged_in) {
-        send_packet(sockfd, LO_NAK, "server", "", "Already logged in on this socket");
+        send_packet(sockfd, LO_NAK, "server", "Already logged in on this socket");
         return;
     }
 
-    if (!verify_credentials(req->source, req->data)) {
-        send_packet(sockfd, LO_NAK, "server", "", "Invalid ID or password");
+    if (!verify_credentials((char *)req->source, (char *)req->data)) {
+        send_packet(sockfd, LO_NAK, "server", "Invalid ID or password");
         return;
     }
 
-    if (find_client_index_by_id(req->source) != -1) {
-        send_packet(sockfd, LO_NAK, "server", "", "User already logged in");
+    if (find_client_index_by_id((char *)req->source) != -1) {
+        send_packet(sockfd, LO_NAK, "server", "User already logged in");
         return;
     }
 
     clients[cidx].logged_in = 1;
-    strncpy(clients[cidx].id, req->source, MAX_NAME - 1);
+    strncpy(clients[cidx].id, (char *)req->source, MAX_NAME - 1);
 
-    send_packet(sockfd, LO_ACK, "server", "", "Login successful");
+    send_packet(sockfd, LO_ACK, "server", "");
     printf("User logged in: %s (sock %d)\n", clients[cidx].id, sockfd);
 }
 
@@ -352,27 +351,29 @@ static void handle_join_req(int sockfd, const struct message *req)
     int cidx = find_client_index_by_sock(sockfd);
     if (cidx == -1) return;
 
+    /* session ID is in data field (not session_id — that field no longer exists) */
+    const char *sess = (char *)req->data;
+
     if (!clients[cidx].logged_in) {
-        send_packet(sockfd, JN_NAK, "server", req->session_id, "Please login first");
+        send_packet(sockfd, JN_NAK, "server", "Please login first");
         return;
     }
 
     if (clients[cidx].session_id[0] != '\0') {
-        send_packet(sockfd, JN_NAK, "server", req->session_id,
-                    "Already in a session");
+        send_packet(sockfd, JN_NAK, "server", "Already in a session");
         return;
     }
 
-    int sidx = find_session_index(req->session_id);
+    int sidx = find_session_index(sess);
     if (sidx == -1) {
-        send_packet(sockfd, JN_NAK, "server", req->session_id,
-                    "Session does not exist");
+        send_packet(sockfd, JN_NAK, "server", "Session does not exist");
         return;
     }
 
-    strncpy(clients[cidx].session_id, req->session_id, MAX_SESSION_ID - 1);
-    send_packet(sockfd, JN_ACK, "server", req->session_id, "Joined session");
-    printf("%s joined session %s\n", clients[cidx].id, req->session_id);
+    strncpy(clients[cidx].session_id, sess, MAX_NAME - 1);
+    /* send session ID back in data so client knows which session was joined */
+    send_packet(sockfd, JN_ACK, "server", sess);
+    printf("%s joined session %s\n", clients[cidx].id, sess);
 }
 
 static void handle_new_sess_req(int sockfd, const struct message *req)
@@ -380,33 +381,34 @@ static void handle_new_sess_req(int sockfd, const struct message *req)
     int cidx = find_client_index_by_sock(sockfd);
     if (cidx == -1) return;
 
+    /* session ID is in data field (not session_id — that field no longer exists) */
+    const char *sess = (char *)req->data;
+
     if (!clients[cidx].logged_in) {
-        send_packet(sockfd, JN_NAK, "server", req->session_id, "Please login first");
+        send_packet(sockfd, JN_NAK, "server", "Please login first");
         return;
     }
 
     if (clients[cidx].session_id[0] != '\0') {
-        send_packet(sockfd, JN_NAK, "server", req->session_id,
-                    "Already in a session");
+        send_packet(sockfd, JN_NAK, "server", "Already in a session");
         return;
     }
 
-    if (find_session_index(req->session_id) != -1) {
-        send_packet(sockfd, JN_NAK, "server", req->session_id,
-                    "Session already exists");
+    if (find_session_index(sess) != -1) {
+        send_packet(sockfd, JN_NAK, "server", "Session already exists");
         return;
     }
 
-    int sidx = create_session_if_needed(req->session_id);
+    int sidx = create_session_if_needed(sess);
     if (sidx == -1) {
-        send_packet(sockfd, JN_NAK, "server", req->session_id,
-                    "Server session table full");
+        send_packet(sockfd, JN_NAK, "server", "Server session table full");
         return;
     }
 
-    strncpy(clients[cidx].session_id, req->session_id, MAX_SESSION_ID - 1);
-    send_packet(sockfd, NS_ACK, "server", req->session_id, req->session_id);
-    printf("%s created session %s\n", clients[cidx].id, req->session_id);
+    strncpy(clients[cidx].session_id, sess, MAX_NAME - 1);
+    /* send session ID back in data so client knows which session was created */
+    send_packet(sockfd, NS_ACK, "server", sess);
+    printf("%s created session %s\n", clients[cidx].id, sess);
 }
 
 static void handle_leave_req(int sockfd)
@@ -432,10 +434,9 @@ static void handle_message_req(int sockfd, const struct message *req)
     struct message out;
     memset(&out, 0, sizeof out);
     out.type = MESSAGE;
-    out.size = (unsigned int)strlen(req->data);
-    strncpy(out.source, clients[cidx].id, MAX_NAME - 1);
-    strncpy(out.session_id, clients[cidx].session_id, MAX_SESSION_ID - 1);
-    strncpy(out.data, req->data, MAX_DATA - 1);
+    out.size = (unsigned int)strlen((char *)req->data);
+    strncpy((char *)out.source, clients[cidx].id,   MAX_NAME - 1);
+    strncpy((char *)out.data,   (char *)req->data,   MAX_DATA - 1);
 
     broadcast_to_session(clients[cidx].session_id, &out);
 }
@@ -446,7 +447,7 @@ static void handle_query_req(int sockfd)
     memset(listbuf, 0, sizeof listbuf);
 
     build_query_response(listbuf, sizeof listbuf);
-    send_packet(sockfd, QU_ACK, "server", "", listbuf);
+    send_packet(sockfd, QU_ACK, "server", listbuf);
 }
 
 static void disconnect_client(int sockfd, fd_set *master)
@@ -588,18 +589,11 @@ int main(int argc, char *argv[])
                 char buf[BUF_SIZE];
                 memset(buf, 0, sizeof buf);
 
-                int total = 0;
-                while (total < BUF_SIZE) {
-                    int n = recv(i, buf + total, BUF_SIZE - total, 0);
-                    if (n <= 0) {
-                        total = n;
-                        break;
-                    }
-                    total += n;
-                }
+                /* single recv call — avoids blocking if client sends less than BUF_SIZE */
+                int n = recv(i, buf, BUF_SIZE - 1, 0);
 
-                if (total <= 0) {
-                    if (total == 0)
+                if (n <= 0) {
+                    if (n == 0)
                         printf("Socket %d closed connection\n", i);
                     else
                         perror("recv");
@@ -607,6 +601,8 @@ int main(int argc, char *argv[])
                     disconnect_client(i, &master);
                     continue;
                 }
+
+                buf[n] = '\0';
 
                 struct message req;
                 parse_message(buf, &req);
@@ -651,5 +647,3 @@ int main(int argc, char *argv[])
     close(listener);
     return 0;
 }
-
-

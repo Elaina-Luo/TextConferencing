@@ -9,9 +9,9 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
-#define MAX_NAME        32
-#define MAX_DATA        512
-#define BUF_SIZE        580
+#define MAX_NAME 32
+#define MAX_DATA 512
+#define BUF_SIZE 580
 #define MAX_COMMAND_LEN 32
 
 // 0 to 12
