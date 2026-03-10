@@ -93,8 +93,7 @@ static int send_message_struct(int sock, const struct message *m)
 
 static int send_packet(int sock, message_t type,
                        const char *source,
-                       const char *data)
-{
+                       const char *data){
     struct message m;
     memset(&m, 0, sizeof m);
     m.type = type;
@@ -107,9 +106,7 @@ static int send_packet(int sock, message_t type,
     return send_message_struct(sock, &m);
 }
 
-/* ═══════════════════════════════════════════════
-   Hardcoded user database
-   ═══════════════════════════════════════════════ */
+
 typedef struct {
     char id[MAX_NAME];
     char password[MAX_DATA];
@@ -121,15 +118,13 @@ static credential_t credentials[] = {
     {"alice", "alice123"},
     {"bob",   "bob123"},
     {"grace", "grace123"},
-    {"lewis", "lewis123"}
+    {"jenny", "jenny123"}
 };
 
 static const int NUM_CREDENTIALS =
     (int)(sizeof(credentials) / sizeof(credentials[0]));
 
-/* ═══════════════════════════════════════════════
-   Server state
-   ═══════════════════════════════════════════════ */
+/*Server state*/
 typedef struct {
     int  active;
     int  sockfd;
@@ -146,9 +141,7 @@ typedef struct {
 static client_info_t  clients[MAX_CLIENTS];
 static session_info_t sessions[MAX_SESSIONS];
 
-/* ═══════════════════════════════════════════════
-   Helpers: lookup / management
-   ═══════════════════════════════════════════════ */
+/*Helpers: lookup / management*/
 static int find_client_index_by_sock(int sockfd)
 {
     for (int i = 0; i < MAX_CLIENTS; i++) {
@@ -299,9 +292,7 @@ static void build_query_response(char *out, size_t out_size)
     }
 }
 
-/* ═══════════════════════════════════════════════
-   Request handlers
-   ═══════════════════════════════════════════════ */
+/*Request handlers*/
 static void handle_login_req(int sockfd, const struct message *req)
 {
     int cidx = find_client_index_by_sock(sockfd);
@@ -454,9 +445,7 @@ static void disconnect_client(int sockfd, fd_set *master)
     FD_CLR(sockfd, master);
 }
 
-/* ═══════════════════════════════════════════════
-   Network setup
-   ═══════════════════════════════════════════════ */
+/*Network setup*/
 static int create_listener(const char *port)
 {
     struct addrinfo hints, *servinfo, *p;
@@ -510,9 +499,7 @@ static int create_listener(const char *port)
     return listener;
 }
 
-/* ═══════════════════════════════════════════════
-   Main
-   ═══════════════════════════════════════════════ */
+
 int main(int argc, char *argv[])
 {
     if (argc != 2) {
