@@ -454,7 +454,7 @@ static int create_listener(const char *port)
     int rv;
 
     memset(&hints, 0, sizeof hints);
-    hints.ai_family   = AF_UNSPEC;
+    hints.ai_family   = AF_UNSPEC; //IPv4 or IPv6
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_flags    = AI_PASSIVE;
 
