@@ -10,12 +10,9 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
-/* ═══════════════════════════════════════════════
-   Protocol constants (must match client.c)
-   ═══════════════════════════════════════════════ */
 #define MAX_NAME        32
 #define MAX_DATA        512
-#define BUF_SIZE        580   /* fixed: no session_id field anymore */
+#define BUF_SIZE        580
 #define MAX_CLIENTS     100
 #define MAX_SESSIONS    100
 
@@ -35,16 +32,6 @@ typedef enum {
     QU_ACK
 } message_t;
 
-/* exact struct from lab spec — no session_id field
-   data carries different things depending on packet type:
-     LOGIN    → password
-     JOIN     → session ID to join
-     JN_ACK   → session ID that was joined
-     JN_NAK   → reason for failure
-     NEW_SESS → session ID to create
-     NS_ACK   → session ID that was created
-     MESSAGE  → chat text
-     QU_ACK   → list of users and sessions              */
 struct message {
     unsigned int  type;
     unsigned int  size;
@@ -52,16 +39,12 @@ struct message {
     unsigned char data[MAX_DATA];
 };
 
-/* ═══════════════════════════════════════════════
-   Serialization – "type:size:source:data"  (3 colons, matches client.c)
-   ═══════════════════════════════════════════════ */
 static int message_to_string(const struct message *m, char *dest)
 {
     memset(dest, 0, BUF_SIZE);
-    /* write type:size:source: prefix, then copy data raw (may contain ':') */
     int prefix_len = snprintf(dest, BUF_SIZE, "%d:%d:%s:", m->type, m->size, (char *)m->source);
     memcpy(dest + prefix_len, m->data, m->size);
-    return prefix_len + m->size;
+    return prefix_len + m->size;                                                                                                                                                                                                         
 }
 
 static void parse_message(const char *src, struct message *m)
