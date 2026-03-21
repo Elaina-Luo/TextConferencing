@@ -14,7 +14,6 @@
 #define BUF_SIZE 580
 #define MAX_COMMAND_LEN 32
 
-// 0 to 12
 typedef enum {
     LOGIN = 0,
     LO_ACK,
@@ -28,7 +27,9 @@ typedef enum {
     NS_ACK,
     MESSAGE,
     QUERY,
-    QU_ACK
+    QU_ACK,
+    KICK,       
+    GIVE_ADMIN  
 } message_t;
 
 struct message {
@@ -111,11 +112,12 @@ static int send_through(int sock, message_t type, const char *source, const char
 }
 
 // track everything about the client's current state
-static int  client_sock   = -1;
+static int  client_sock = -1;
 static int  is_in_session = 0;
 static char cur_session[MAX_NAME] = "";
 static char cur_name[MAX_NAME]    = "";
-static int  logged_in     = 0;
+static int  logged_in = 0;
+static int  is_admin  = 0; // Section 2: 1 if we are admin of cur_session
 
 // Receive one packet from server synchronously.
 // Only used for login — all other responses come through handle_server()
@@ -216,6 +218,7 @@ static int logout(void)
     client_sock   = -1;
     logged_in     = 0;
     is_in_session = 0;
+    is_admin      = 0; //clear admin flag on logout
     memset(cur_name, 0, sizeof cur_name);
     memset(cur_session, 0, sizeof cur_session);
     printf("Logged out.\n");
@@ -245,6 +248,7 @@ static int leave_session(void)
     send_through(client_sock, LEAVE_SESS, cur_name, "");
     printf("Left session %s\n", cur_session);
     is_in_session = 0;
+    is_admin      = 0; //clear admin flag on leave
     memset(cur_session, 0, sizeof cur_session);
     return 0;
 }
@@ -291,6 +295,34 @@ static int send_message(const char *text)
     return 0;
 }
 
+// /kick <client_id>, admin only, kicks a client from the session
+static int kick(const char *target_id)
+{
+    if (!logged_in)    { printf("Not logged in.\n"); return 1; }
+    if (!is_in_session){ printf("Not in a session.\n"); return 1; }
+    if (!is_admin)     { printf("You are not the admin of this session.\n"); return 1; }
+
+    // send KICK — data = target client ID
+    // server verifies admin, removes target, sends KICK to target
+    send_through(client_sock, KICK, cur_name, target_id);
+    return 0;
+}
+
+// /giveadmin <client_id> — admin only, transfers admin role
+static int give_admin(const char *target_id)
+{
+    if (!logged_in)    { printf("Not logged in.\n"); return 1; }
+    if (!is_in_session){ printf("Not in a session.\n"); return 1; }
+    if (!is_admin)     { printf("You are not the admin of this session.\n"); return 1; }
+
+    // send GIVE_ADMIN — data = target client ID
+    // server transfers admin and notifies target with GIVE_ADMIN packet
+    send_through(client_sock, GIVE_ADMIN, cur_name, target_id);
+    is_admin = 0; 
+    printf("Admin transferred to %s.\n", target_id);
+    return 0;
+}
+
 // parse and dispatch one line of user input from stdin
 static void handle_stdin(void)
 {
@@ -300,6 +332,7 @@ static void handle_stdin(void)
     char pass[MAX_DATA];
     char server_ip[64];
     char server_port[16];
+    char target_id[MAX_NAME]; // for /kick and /giveadmin
 
     // read first token (the command word)
     if (scanf("%s", command) != 1) return;
@@ -327,6 +360,14 @@ static void handle_stdin(void)
 
     } else if (strcmp(command, "/quit") == 0) {
         quit();
+
+    } else if (strcmp(command, "/kick") == 0) {
+        scanf(" %s", target_id);
+        kick(target_id);
+
+    } else if (strcmp(command, "/giveadmin") == 0) {
+        scanf(" %s", target_id);
+        give_admin(target_id);
 
     } else {
         // not a command — treat as chat message to current session
@@ -365,6 +406,7 @@ static void handle_server(void)
         client_sock   = -1;
         logged_in     = 0;
         is_in_session = 0;
+        is_admin      = 0; 
         return;
     }
     buf[n] = '\0';
@@ -375,7 +417,6 @@ static void handle_server(void)
     switch (m.type) {
 
     case MESSAGE:
-        // incoming chat message from another user — data = text
         print_message(&m);
         break;
 
@@ -383,6 +424,7 @@ static void handle_server(void)
         // server confirmed join — data = session ID we joined
         strncpy(cur_session, (char *)m.data, MAX_NAME - 1);
         is_in_session = 1;
+        is_admin      = 0; 
         printf("Successfully joined session: %s\n", cur_session);
         break;
 
@@ -393,19 +435,37 @@ static void handle_server(void)
 
     case NS_ACK:
         // server confirmed session created — data = session ID
+        // creator automatically becomes admin
         strncpy(cur_session, (char *)m.data, MAX_NAME - 1);
         is_in_session = 1;
+        is_admin = 1; 
         printf("Successfully created session: %s\n", cur_session);
+        printf("[You are the admin. Use /kick <id> or /giveadmin <id>]\n");
         break;
 
     case QU_ACK:
-        // response to /list — data = formatted list of users and sessions
+        // response to /list — data = formatted list of users, sessions, admins
         printf("Users and sessions:\n%s\n", (char *)m.data);
         break;
 
     case LO_NAK:
         // server rejected login after connection (e.g. duplicate login)
         printf("Server rejected login: %s\n", (char *)m.data);
+        break;
+
+    // server kicked us from our session
+    case KICK:
+        printf("[You have been kicked from session '%s': %s]\n",
+               cur_session, (char *)m.data);
+        is_in_session = 0;
+        is_admin      = 0;
+        memset(cur_session, 0, sizeof cur_session);
+        break;
+
+    // server notifying us we are now admin
+    case GIVE_ADMIN:
+        is_admin = 1;
+        printf("[You are now the admin of session '%s']\n", (char *)m.data);
         break;
 
     default:
@@ -420,7 +480,8 @@ int main(void)
     printf("Text Conferencing Client\n");
     printf("Commands: /login <id> <pass> <ip> <port>\n");
     printf("          /logout  /joinsession <id>  /leavesession\n");
-    printf("          /createsession <id>  /list  /quit\n\n");
+    printf("          /createsession <id>  /list  /quit\n");
+    printf("          /kick <id>  /giveadmin <id>  [admin only]\n\n");
     //int select(int numfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds, struct timeval *timeout);
     //FD_SET(int fd, fd_set *set); Add fd to the set.
     //FD_CLR(int fd, fd_set *set); Remove fd from the set.
@@ -429,6 +490,7 @@ int main(void)
     for (;;) {
         FD_ZERO(&fds);
         FD_SET(fileno(stdin), &fds); // always watch keyboard
+        //The fileno() method returns the file descriptor of the stream, as a number
 
         if (client_sock > 0) {
             FD_SET(client_sock, &fds); // also watch socket when connected

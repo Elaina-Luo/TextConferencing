@@ -29,7 +29,9 @@ typedef enum {
     NS_ACK,
     MESSAGE,
     QUERY,
-    QU_ACK
+    QU_ACK,
+    KICK,       
+    GIVE_ADMIN  
 } message_t;
 
 struct message {
@@ -44,7 +46,7 @@ static int message_to_string(const struct message *m, char *dest)
     memset(dest, 0, BUF_SIZE);
     int prefix_len = snprintf(dest, BUF_SIZE, "%d:%d:%s:", m->type, m->size, (char *)m->source);
     memcpy(dest + prefix_len, m->data, m->size);
-    return prefix_len + m->size;                                                                                                                                                                                                         
+    return prefix_len + m->size;
 }
 
 static void parse_message(const char *src, struct message *m)
@@ -82,7 +84,6 @@ static void parse_message(const char *src, struct message *m)
 static int send_message_struct(int sock, const struct message *m)
 {
     char buf[BUF_SIZE];
-   
     int len = message_to_string(m, buf);
     int n = send(sock, buf, len, 0);
     if (n <= 0) {
@@ -93,7 +94,8 @@ static int send_message_struct(int sock, const struct message *m)
 
 static int send_packet(int sock, message_t type,
                        const char *source,
-                       const char *data){
+                       const char *data)
+{
     struct message m;
     memset(&m, 0, sizeof m);
     m.type = type;
@@ -126,16 +128,17 @@ static const int NUM_CREDENTIALS =
 
 /*Server state*/
 typedef struct {
-    int  active;
-    int  sockfd;
-    char id[MAX_NAME];
-    char session_id[MAX_NAME];  /* current session, "" = none */
-    int  logged_in;
+    int    active;
+    int    sockfd;
+    char   id[MAX_NAME];
+    char   session_id[MAX_NAME];  /* current session, "" = none */
+    int    logged_in;
 } client_info_t;
 
 typedef struct {
     int  active;
     char session_id[MAX_NAME];
+    char admin_id[MAX_NAME];      
 } session_info_t;
 
 static client_info_t  clients[MAX_CLIENTS];
@@ -166,8 +169,8 @@ static int add_client(int sockfd)
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (!clients[i].active) {
             memset(&clients[i], 0, sizeof(clients[i]));
-            clients[i].active = 1;
-            clients[i].sockfd = sockfd;
+            clients[i].active      = 1;
+            clients[i].sockfd      = sockfd;
             return i;
         }
     }
@@ -248,6 +251,29 @@ static void leave_current_session(int client_idx)
     strncpy(old_session, clients[client_idx].session_id, MAX_NAME - 1);
 
     memset(clients[client_idx].session_id, 0, sizeof(clients[client_idx].session_id));
+
+    // if leaving client was admin, transfer admin to next member
+    int sidx = find_session_index(old_session);
+    if (sidx != -1 &&
+        strcmp(sessions[sidx].admin_id, clients[client_idx].id) == 0) {
+        int transferred = 0;
+        for (int i = 0; i < MAX_CLIENTS; i++) {
+            if (clients[i].active && clients[i].logged_in &&
+                strcmp(clients[i].session_id, old_session) == 0 &&
+                i != client_idx) {
+                strncpy(sessions[sidx].admin_id, clients[i].id, MAX_NAME - 1);
+                // notify new admin
+                send_packet(clients[i].sockfd, GIVE_ADMIN, "server", old_session);
+                printf("[server] Admin of '%s' transferred to '%s' (old admin left)\n",
+                       old_session, clients[i].id);
+                transferred = 1;
+                break;
+            }
+        }
+        if (!transferred)
+            memset(sessions[sidx].admin_id, 0, MAX_NAME);
+    }
+
     delete_session_if_empty(old_session);
 }
 
@@ -285,7 +311,11 @@ static void build_query_response(char *out, size_t out_size)
 
     for (int i = 0; i < MAX_SESSIONS; i++) {
         if (sessions[i].active) {
-            n = snprintf(out + used, out_size - used, "  %s\n", sessions[i].session_id);
+            // Section 2: show admin next to each session
+            n = snprintf(out + used, out_size - used,
+                         "  %s  [admin: %s]\n",
+                         sessions[i].session_id,
+                         sessions[i].admin_id[0] ? sessions[i].admin_id : "(none)");
             if (n < 0 || (size_t)n >= out_size - used) return;
             used += (size_t)n;
         }
@@ -313,7 +343,7 @@ static void handle_login_req(int sockfd, const struct message *req)
         return;
     }
 
-    clients[cidx].logged_in = 1;
+    clients[cidx].logged_in   = 1;
     strncpy(clients[cidx].id, (char *)req->source, MAX_NAME - 1);
 
     send_packet(sockfd, LO_ACK, "server", "");
@@ -325,7 +355,7 @@ static void handle_join_req(int sockfd, const struct message *req)
     int cidx = find_client_index_by_sock(sockfd);
     if (cidx == -1) return;
 
-    /* session ID is in data field (not session_id — that field no longer exists) */
+    /* session ID is in data field */
     const char *sess = (char *)req->data;
 
     if (!clients[cidx].logged_in) {
@@ -355,7 +385,7 @@ static void handle_new_sess_req(int sockfd, const struct message *req)
     int cidx = find_client_index_by_sock(sockfd);
     if (cidx == -1) return;
 
-    /* session ID is in data field (not session_id — that field no longer exists) */
+    /* session ID is in data field */
     const char *sess = (char *)req->data;
 
     if (!clients[cidx].logged_in) {
@@ -380,9 +410,13 @@ static void handle_new_sess_req(int sockfd, const struct message *req)
     }
 
     strncpy(clients[cidx].session_id, sess, MAX_NAME - 1);
+    // creator becomes admin
+    strncpy(sessions[sidx].admin_id, clients[cidx].id, MAX_NAME - 1);
+
     /* send session ID back in data so client knows which session was created */
     send_packet(sockfd, NS_ACK, "server", sess);
-    printf("%s created session %s\n", clients[cidx].id, sess);
+    printf("%s created session %s (admin: %s)\n",
+           clients[cidx].id, sess, clients[cidx].id);
 }
 
 static void handle_leave_req(int sockfd)
@@ -422,6 +456,87 @@ static void handle_query_req(int sockfd)
 
     build_query_response(listbuf, sizeof listbuf);
     send_packet(sockfd, QU_ACK, "server", listbuf);
+}
+
+// kick handler — admin only, removes target from session
+static void handle_kick_req(int sockfd, const struct message *req)
+{
+    int cidx = find_client_index_by_sock(sockfd);
+    if (cidx == -1) return;
+    if (!clients[cidx].logged_in) return;
+    if (clients[cidx].session_id[0] == '\0') {
+        send_packet(sockfd, JN_NAK, "server", "You are not in a session");
+        return;
+    }
+
+    // verify sender is admin
+    int sidx = find_session_index(clients[cidx].session_id);
+    if (sidx == -1 ||
+        strcmp(sessions[sidx].admin_id, clients[cidx].id) != 0) {
+        send_packet(sockfd, JN_NAK, "server", "You are not the admin");
+        return;
+    }
+
+    const char *target_id = (char *)req->data;
+    int tidx = find_client_index_by_id(target_id);
+    if (tidx == -1) {
+        send_packet(sockfd, JN_NAK, "server", "Target user not found");
+        return;
+    }
+    if (strcmp(clients[tidx].session_id, clients[cidx].session_id) != 0) {
+        send_packet(sockfd, JN_NAK, "server", "Target is not in your session");
+        return;
+    }
+
+    // notify kicked client — data = reason
+    char reason[MAX_DATA];
+    snprintf(reason, sizeof reason, "Kicked by admin %s", clients[cidx].id);
+    send_packet(clients[tidx].sockfd, KICK, "server", reason);
+
+    // remove target from session
+    memset(clients[tidx].session_id, 0, sizeof(clients[tidx].session_id));
+    printf("[server] %s kicked %s from session %s\n",
+           clients[cidx].id, target_id, sessions[sidx].session_id);
+    delete_session_if_empty(sessions[sidx].session_id);
+}
+
+// give_admin handler — transfers admin role to another client
+static void handle_give_admin_req(int sockfd, const struct message *req)
+{
+    int cidx = find_client_index_by_sock(sockfd);
+    if (cidx == -1) return;
+    if (!clients[cidx].logged_in) return;
+    if (clients[cidx].session_id[0] == '\0') {
+        send_packet(sockfd, JN_NAK, "server", "You are not in a session");
+        return;
+    }
+
+    // verify sender is admin
+    int sidx = find_session_index(clients[cidx].session_id);
+    if (sidx == -1 ||
+        strcmp(sessions[sidx].admin_id, clients[cidx].id) != 0) {
+        send_packet(sockfd, JN_NAK, "server", "You are not the admin");
+        return;
+    }
+
+    const char *target_id = (char *)req->data;
+    int tidx = find_client_index_by_id(target_id);
+    if (tidx == -1) {
+        send_packet(sockfd, JN_NAK, "server", "Target user not found");
+        return;
+    }
+    if (strcmp(clients[tidx].session_id, clients[cidx].session_id) != 0) {
+        send_packet(sockfd, JN_NAK, "server", "Target is not in your session");
+        return;
+    }
+
+    // transfer admin
+    strncpy(sessions[sidx].admin_id, target_id, MAX_NAME - 1);
+    // notify new admin — data = session name so client knows which session
+    send_packet(clients[tidx].sockfd, GIVE_ADMIN, "server",
+                clients[cidx].session_id);
+    printf("[server] Admin of '%s' transferred from '%s' to '%s'\n",
+           sessions[sidx].session_id, clients[cidx].id, target_id);
 }
 
 static void disconnect_client(int sockfd, fd_set *master)
@@ -604,6 +719,13 @@ int main(int argc, char *argv[])
 
                     case QUERY:
                         handle_query_req(i);
+                        break;
+                    case KICK:
+                        handle_kick_req(i, &req);
+                        break;
+
+                    case GIVE_ADMIN:
+                        handle_give_admin_req(i, &req);
                         break;
 
                     default:
